@@ -468,6 +468,24 @@ const GAME_CONFIG = {
   edgeMargin: 16,
   settleThreshold: 0.4,
   cooldownMs: 380,          // minimum time between successive escapes, per button
+
+  // Anticipation: an invisible zone this many px larger than the button on
+  // every side. A touch landing anywhere in that zone launches the button
+  // immediately on pointerdown, before the tap "visually" completes.
+  noEscapeRadius: 70,
+  yesEscapeRadius: 70,
+
+  // Movement is split into this many mini-steps per animation frame so a
+  // fast-moving button can't tunnel through a wall or through the other
+  // button between frames.
+  physicsSubsteps: 4,
+};
+
+// Separate config for the YES/NO elastic collision, per the brief's spec.
+const PHYSICS = {
+  yesMass: 1,
+  noMass: 1.1,
+  collisionRestitution: 0.9,
 };
 
 const YES_ATTEMPT_MESSAGES = ["Too slow…", "Almost…", "You're getting closer…", "Okay, you're persistent…", "So close…"];
@@ -536,8 +554,32 @@ function measureFinalGeometry() {
   });
 }
 
-function withinRect(x, y, rect) {
-  return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+// Rectangular "danger zone" — the actual button padded out by `radius` on
+// every side. A touch anywhere inside counts as touching the button itself,
+// which is what makes the buttons feel like they react before contact.
+function withinEscapeZone(x, y, ball, radius) {
+  const left = ball.home.x + ball.offset.x - radius;
+  const right = ball.home.x + ball.home.w + ball.offset.x + radius;
+  const top = ball.home.y + ball.offset.y - radius;
+  const bottom = ball.home.y + ball.home.h + ball.offset.y + radius;
+  return x >= left && x <= right && y >= top && y <= bottom;
+}
+
+// Bounding-circle approximation of a button, used only for the YES/NO
+// mutual-collision physics (a simple circle-circle model is what the
+// elastic-collision math below is built for).
+function ballCenter(ball) {
+  const w = ball.home.w, h = ball.home.h;
+  return {
+    x: ball.home.x + w / 2 + ball.offset.x,
+    y: ball.home.y + h / 2 + ball.offset.y,
+    r: (Math.max(w, h) / 2) * 0.8,
+  };
+}
+
+function clampBallToBounds(ball) {
+  ball.offset.x = clamp(ball.offset.x, ball.bounds.minDx, ball.bounds.maxDx);
+  ball.offset.y = clamp(ball.offset.y, ball.bounds.minDy, ball.bounds.maxDy);
 }
 
 /* ---------- Shared launch impulse — instant, high-speed, away from touch ---------- */
@@ -560,6 +602,8 @@ function launchBall(ball, touchX, touchY, speed, friction) {
   const rdx = dx * cos - dy * sin;
   const rdy = dx * sin + dy * cos;
 
+  // Set velocity directly (not accumulated) so frame one already has full
+  // speed — there is no "wind-up," it's already moving at launch speed.
   ball.vel.x = rdx * speed;
   ball.vel.y = rdy * speed;
   ball.rotVel = rand(-14, 14);
@@ -582,42 +626,114 @@ function flashImpact(ball) {
   ball._impactTimer = setTimeout(() => ball.el.classList.remove("impact"), 180);
 }
 
-/* ---------- Shared physics step — real velocity + wall collisions ---------- */
-function stepBall(ball) {
+/* ---------- Screen shake, used on button-button collisions ---------- */
+let shakeTimer = null;
+function screenShake() {
+  if (prefersReducedMotion) return;
+  const app = document.getElementById("app");
+  app.classList.remove("shake");
+  // Force reflow so the animation restarts if triggered again quickly.
+  void app.offsetWidth;
+  app.classList.add("shake");
+  clearTimeout(shakeTimer);
+  shakeTimer = setTimeout(() => app.classList.remove("shake"), 220);
+}
+
+/* ---------- Movement + wall collision for one mini-step of a frame ---------- */
+function integrateBallSubstep(ball, dtFraction) {
+  if (!ball.moving) return;
+
+  ball.vel.x = clamp(ball.vel.x, -GAME_CONFIG.maxVelocity, GAME_CONFIG.maxVelocity);
+  ball.vel.y = clamp(ball.vel.y, -GAME_CONFIG.maxVelocity, GAME_CONFIG.maxVelocity);
+
+  ball.offset.x += ball.vel.x * dtFraction;
+  ball.offset.y += ball.vel.y * dtFraction;
+
+  const b = ball.bounds;
+  let bounced = false;
+  if (ball.offset.x < b.minDx) {
+    ball.offset.x = b.minDx; ball.vel.x *= -GAME_CONFIG.restitution;
+    ball.stretch = 1.1; ball.squash = 0.92; bounced = true;
+  } else if (ball.offset.x > b.maxDx) {
+    ball.offset.x = b.maxDx; ball.vel.x *= -GAME_CONFIG.restitution;
+    ball.stretch = 1.1; ball.squash = 0.92; bounced = true;
+  }
+  if (ball.offset.y < b.minDy) {
+    ball.offset.y = b.minDy; ball.vel.y *= -GAME_CONFIG.restitution;
+    ball.stretch = 0.92; ball.squash = 1.1; bounced = true;
+  } else if (ball.offset.y > b.maxDy) {
+    ball.offset.y = b.maxDy; ball.vel.y *= -GAME_CONFIG.restitution;
+    ball.stretch = 0.92; ball.squash = 1.1; bounced = true;
+  }
+
+  if (bounced) {
+    flashImpact(ball);
+    const cx = ball.home.x + ball.home.w / 2 + ball.offset.x;
+    const cy = ball.home.y + ball.home.h / 2 + ball.offset.y;
+    spawnImpactSparks(cx, cy, 4);
+    ball.rotVel += rand(-6, 6);
+  }
+}
+
+// Elastic circle-circle collision between YES and NO. Separates any overlap
+// immediately (so fast-moving buttons can't get stuck inside each other),
+// then resolves velocities using standard impulse-based elastic collision
+// (relative velocity along the collision normal, masses from PHYSICS).
+function resolveBallCollision(a, aMass, b, bMass) {
+  const ac = ballCenter(a);
+  const bc = ballCenter(b);
+  const dx = bc.x - ac.x;
+  const dy = bc.y - ac.y;
+  const dist = Math.hypot(dx, dy) || 0.0001;
+  const minDist = ac.r + bc.r;
+  if (dist >= minDist) return;
+
+  const nx = dx / dist, ny = dy / dist;
+
+  // Separate along the collision normal, proportional to the other body's
+  // mass (a heavier NO pushes a lighter YES back further, and vice versa).
+  const overlap = minDist - dist;
+  const totalMass = aMass + bMass;
+  const pushA = overlap * (bMass / totalMass);
+  const pushB = overlap * (aMass / totalMass);
+  a.offset.x -= nx * pushA; a.offset.y -= ny * pushA;
+  b.offset.x += nx * pushB; b.offset.y += ny * pushB;
+  clampBallToBounds(a);
+  clampBallToBounds(b);
+
+  // Relative velocity along the normal — skip if already separating.
+  const rvx = b.vel.x - a.vel.x;
+  const rvy = b.vel.y - a.vel.y;
+  const velAlongNormal = rvx * nx + rvy * ny;
+  if (velAlongNormal > 0) return;
+
+  const e = PHYSICS.collisionRestitution;
+  const j = -(1 + e) * velAlongNormal / (1 / aMass + 1 / bMass);
+  const impulseX = j * nx, impulseY = j * ny;
+
+  a.vel.x -= impulseX / aMass; a.vel.y -= impulseY / aMass;
+  b.vel.x += impulseX / bMass; b.vel.y += impulseY / bMass;
+  a.rotVel += rand(-12, 12);
+  b.rotVel += rand(-12, 12);
+  a.stretch = 1.14; a.squash = 0.88;
+  b.stretch = 1.14; b.squash = 0.88;
+  a.moving = true; b.moving = true;
+
+  flashImpact(a);
+  flashImpact(b);
+  const midX = (ac.x + bc.x) / 2, midY = (ac.y + bc.y) / 2;
+  spawnImpactSparks(midX, midY, 9);
+  screenShake();
+  vibrate(16);
+}
+
+// Friction/rotation decay, settle detection, and the final transform write —
+// run once per full animation frame (not per substep), after movement and
+// collisions have already been resolved for this frame.
+function finalizeBallFrame(ball) {
   if (!ball.home.w) return;
 
   if (ball.moving) {
-    ball.vel.x = clamp(ball.vel.x, -GAME_CONFIG.maxVelocity, GAME_CONFIG.maxVelocity);
-    ball.vel.y = clamp(ball.vel.y, -GAME_CONFIG.maxVelocity, GAME_CONFIG.maxVelocity);
-
-    ball.offset.x += ball.vel.x;
-    ball.offset.y += ball.vel.y;
-
-    const b = ball.bounds;
-    let bounced = false;
-    if (ball.offset.x < b.minDx) {
-      ball.offset.x = b.minDx; ball.vel.x *= -GAME_CONFIG.restitution;
-      ball.stretch = 1.1; ball.squash = 0.92; bounced = true;
-    } else if (ball.offset.x > b.maxDx) {
-      ball.offset.x = b.maxDx; ball.vel.x *= -GAME_CONFIG.restitution;
-      ball.stretch = 1.1; ball.squash = 0.92; bounced = true;
-    }
-    if (ball.offset.y < b.minDy) {
-      ball.offset.y = b.minDy; ball.vel.y *= -GAME_CONFIG.restitution;
-      ball.stretch = 0.92; ball.squash = 1.1; bounced = true;
-    } else if (ball.offset.y > b.maxDy) {
-      ball.offset.y = b.maxDy; ball.vel.y *= -GAME_CONFIG.restitution;
-      ball.stretch = 0.92; ball.squash = 1.1; bounced = true;
-    }
-
-    if (bounced) {
-      flashImpact(ball);
-      const cx = ball.home.x + ball.home.w / 2 + ball.offset.x;
-      const cy = ball.home.y + ball.home.h / 2 + ball.offset.y;
-      spawnImpactSparks(cx, cy, 4);
-      ball.rotVel += rand(-6, 6);
-    }
-
     ball.vel.x *= ball.currentFriction;
     ball.vel.y *= ball.currentFriction;
     ball.rotVel *= 0.985;
@@ -639,11 +755,28 @@ function stepBall(ball) {
     `translate3d(${ball.offset.x}px, ${ball.offset.y}px, 0) rotate(${ball.rot}deg) scale(${ball.stretch}, ${ball.squash})`;
 }
 
-// Called every animation frame from masterLoop.
+// Called every animation frame from masterLoop. Splits movement into
+// several mini-steps so two fast-moving buttons can't tunnel through each
+// other (or a wall) between one frame and the next.
 function updateNoButton() {
   if (!screens.final.classList.contains("active") || hasProposed) return;
-  if (!noEliminated) stepBall(noBall);
-  if (!yesCatchable) stepBall(yesBall);
+
+  const yesActive = !yesCatchable;
+  const noActive = !noEliminated;
+  const bothActive = yesActive && noActive;
+
+  const steps = GAME_CONFIG.physicsSubsteps;
+  for (let i = 0; i < steps; i++) {
+    if (yesActive) integrateBallSubstep(yesBall, 1 / steps);
+    if (noActive) integrateBallSubstep(noBall, 1 / steps);
+    // Buttons only knock each other around while both are still "in play" —
+    // once YES is caught (stationary) or NO has shattered (gone), neither
+    // should be displaced by a collision anymore.
+    if (bothActive) resolveBallCollision(yesBall, PHYSICS.yesMass, noBall, PHYSICS.noMass);
+  }
+
+  if (yesActive) finalizeBallFrame(yesBall);
+  if (noActive) finalizeBallFrame(noBall);
 }
 
 /* ---------- Feedback line ---------- */
@@ -721,10 +854,6 @@ function crackAndShatterNo() {
   }, prefersReducedMotion ? 60 : 260);
 }
 
-noBtn.addEventListener("pointerdown", (e) => {
-  attemptNo(e.clientX, e.clientY);
-  e.preventDefault();
-});
 noBtn.addEventListener("click", (e) => e.preventDefault()); // never selectable
 
 /* ==========================================================================
@@ -767,27 +896,37 @@ function attemptYes(x, y) {
   }
 }
 
-yesBtn.addEventListener("pointerdown", (e) => {
-  if (yesCatchable) return; // let the tap register normally
-  attemptYes(e.clientX, e.clientY);
-  e.preventDefault();
-});
-
-// Dragging onto either button counts the same as pressing it directly —
-// but only while it's genuinely still in its escaping state.
-window.addEventListener("pointermove", (e) => {
+// ==========================================================================
+// ANTICIPATION DETECTION — the core of this revision.
+//
+// A normal iPhone site can't see a finger before it lands, so this fakes
+// the effect: each button has an invisible zone (its real bounds padded
+// out by *EscapeRadius px on every side). The moment a pointerdown lands
+// anywhere in that zone — not necessarily on the button itself — the
+// button launches immediately, before any click/tap-complete event could
+// ever fire. pointermove provides the same check while a finger is
+// actively dragging across the screen, so approaching the button mid-drag
+// also triggers the escape before contact.
+// ==========================================================================
+function checkAnticipation(x, y) {
   if (!screens.final.classList.contains("active") || hasProposed) return;
-  if (e.buttons === 0 && e.pointerType === "mouse") return; // only chase while actively pressed/dragging (mouse)
 
-  if (!noEliminated) {
-    const nr = noBtn.getBoundingClientRect();
-    if (withinRect(e.clientX, e.clientY, nr)) attemptNo(e.clientX, e.clientY);
+  if (!noEliminated && withinEscapeZone(x, y, noBall, GAME_CONFIG.noEscapeRadius)) {
+    attemptNo(x, y);
   }
-  if (!yesCatchable) {
-    const yr = yesBtn.getBoundingClientRect();
-    if (withinRect(e.clientX, e.clientY, yr)) attemptYes(e.clientX, e.clientY);
+  if (!yesCatchable && withinEscapeZone(x, y, yesBall, GAME_CONFIG.yesEscapeRadius)) {
+    attemptYes(x, y);
   }
-});
+}
+
+window.addEventListener("pointerdown", (e) => {
+  checkAnticipation(e.clientX, e.clientY);
+}, { passive: true });
+
+window.addEventListener("pointermove", (e) => {
+  if (e.buttons === 0 && e.pointerType === "mouse") return; // only chase while actively pressed/dragging (mouse)
+  checkAnticipation(e.clientX, e.clientY);
+}, { passive: true });
 
 function triggerYes() {
   if (hasProposed || !yesCatchable) return;
