@@ -455,7 +455,7 @@ const feedbackEl = document.getElementById("game-feedback");
 // ---- Easy-to-tune game configuration ----
 const GAME_CONFIG = {
   yesAttemptsToUnlock: 5,   // genuine taps on YES before it stops fleeing
-  yesStartingSpeed: 32,     // launch speed on the very first YES attempt
+  yesStartingSpeed: 35,     // launch speed on the very first YES attempt — same as NO's first hit
   yesSpeedReduction: 0.78,  // multiplier applied to speed after each attempt
 
   noSpeed: 35,              // launch speed on NO's first attempt
@@ -463,7 +463,7 @@ const GAME_CONFIG = {
   noAttemptsBeforeShatter: 3, // which attempt triggers the glass break
 
   friction: 0.985,
-  restitution: 0.92,
+  restitution: 0.95,
   maxVelocity: 60,
   edgeMargin: 16,
   settleThreshold: 0.4,
@@ -566,8 +566,8 @@ function launchBall(ball, touchX, touchY, speed, friction) {
   ball.moving = true;
   ball.currentFriction = friction;
 
-  ball.stretch = 1.32;
-  ball.squash = 0.7;
+  ball.stretch = 1.1;
+  ball.squash = 0.92;
 
   flashImpact(ball);
   spawnImpactSparks(touchX, touchY, 5);
@@ -597,17 +597,17 @@ function stepBall(ball) {
     let bounced = false;
     if (ball.offset.x < b.minDx) {
       ball.offset.x = b.minDx; ball.vel.x *= -GAME_CONFIG.restitution;
-      ball.stretch = 1.24; ball.squash = 0.78; bounced = true;
+      ball.stretch = 1.1; ball.squash = 0.92; bounced = true;
     } else if (ball.offset.x > b.maxDx) {
       ball.offset.x = b.maxDx; ball.vel.x *= -GAME_CONFIG.restitution;
-      ball.stretch = 1.24; ball.squash = 0.78; bounced = true;
+      ball.stretch = 1.1; ball.squash = 0.92; bounced = true;
     }
     if (ball.offset.y < b.minDy) {
       ball.offset.y = b.minDy; ball.vel.y *= -GAME_CONFIG.restitution;
-      ball.stretch = 0.8; ball.squash = 1.24; bounced = true;
+      ball.stretch = 0.92; ball.squash = 1.1; bounced = true;
     } else if (ball.offset.y > b.maxDy) {
       ball.offset.y = b.maxDy; ball.vel.y *= -GAME_CONFIG.restitution;
-      ball.stretch = 0.8; ball.squash = 1.24; bounced = true;
+      ball.stretch = 0.92; ball.squash = 1.1; bounced = true;
     }
 
     if (bounced) {
@@ -632,8 +632,8 @@ function stepBall(ball) {
     }
   }
 
-  ball.squash = lerp(ball.squash, 1, 0.15);
-  ball.stretch = lerp(ball.stretch, 1, 0.15);
+  ball.squash = lerp(ball.squash, 1, 0.4);
+  ball.stretch = lerp(ball.stretch, 1, 0.4);
 
   ball.el.style.transform =
     `translate3d(${ball.offset.x}px, ${ball.offset.y}px, 0) rotate(${ball.rot}deg) scale(${ball.stretch}, ${ball.squash})`;
